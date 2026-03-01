@@ -1,122 +1,127 @@
 # Agent Loop
 
-Three AI agents (Claude, Codex, Gemini) collaboratively research open-ended questions through structured phases — not by taking turns writing essays, but by independently researching with real tools, cross-reviewing each other's findings, and revising their framework when evidence demands it.
+三个 AI Agent（Claude、Codex、Gemini）通过结构化的研究流程协作探究开放性问题。它们不是轮流"写作文"，而是各自带着工具去做真正的研究、交叉审查彼此的发现、在证据不支持时推翻原有框架。
 
-## Why
+## 为什么需要这个
 
-A single LLM can give you multiple perspectives on any topic. But it's drawing from one knowledge base, one set of biases, and zero real-time research. Agent Loop is different:
+单个大模型可以给你任何话题的多角度分析。但它本质上用的是同一个知识库、同一套偏见、零实时研究能力。Agent Loop 不同：
 
-- Each agent **actually searches the web**, finds data, and cites sources
-- Agents **challenge each other's findings** with verification searches
-- The research framework **can be revised mid-process** when evidence contradicts initial assumptions
-- The final report is grounded in **cross-validated evidence**, not opinion
+- 每个 Agent **真正进行网络搜索**，查找数据，引用来源
+- Agent 之间**交叉审查发现**，搜索验证对方的引用
+- Claude 执行专门的**证据审计**——逐一验证引用来源，标记虚假信息
+- 研究框架**可以在过程中修正**——当证据推翻原始假设时
+- 最终报告基于**经审计、交叉验证的证据**，而非观点
 
-## How It Works
+## 工作流程
 
 ```
-Question
+研究问题
    ↓
-Phase 1: DECOMPOSE — Break into researchable sub-questions
+Phase 1:   DECOMPOSE（拆解）     — 将问题拆解为可研究的子问题
    ↓
-Phase 2: RESEARCH  — 3 agents research in parallel (with web search)
+Phase 2:   RESEARCH（研究）      — 3 个 Agent 并行研究（启用网络搜索）
    ↓
-Phase 3: CHALLENGE — Cross-review findings, verify claims, find counter-evidence
+Phase 3:   CHALLENGE（质疑）     — 交叉审查发现，验证引用，寻找反面证据
    ↓
-Phase 4: REFRAME   — Revise framework if needed → triggers supplementary research
+Phase 3.5: EVIDENCE AUDIT（审计）— Claude 审计证据质量，验证来源，标记虚假信息
    ↓
-Phase 5: SYNTHESIZE — Produce evidence-based research report
+Phase 4:   REFRAME（修正）       — 评估框架是否需要修正 → 触发补充研究
    ↓
-Phase 6: REPORT    — Generate HTML report, save to Desktop, auto-open
+Phase 5:   SYNTHESIZE（综合）    — 产出基于证据的研究报告
+   ↓
+Phase 6:   REPORT（报告）        — 生成 HTML 报告，保存到桌面并自动打开
 ```
 
-## Prerequisites
+## 环境要求
 
-Three CLI tools installed and authenticated:
+三个 CLI 工具需安装并完成认证：
 
-| Tool | Install | Auth |
-|------|---------|------|
+| 工具 | 安装 | 认证 |
+|------|------|------|
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `npm install -g @anthropic-ai/claude-code` | `claude auth` |
 | [Codex CLI](https://github.com/openai/codex) | `brew install codex` | `codex login` |
-| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `npm install -g @google/gemini-cli` | `gemini` (OAuth on first run) |
+| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `npm install -g @google/gemini-cli` | `gemini`（首次运行 OAuth） |
 
-Python 3.10+ (no external dependencies).
+Python 3.10+，无外部依赖。
 
-## Usage
+## 使用方法
 
 ```bash
-# Basic usage (all 6 phases)
-python3 agent_loop.py "Your research question here"
+# 基本用法（完整 7 阶段流程）
+python3 agent_loop.py "你的研究问题"
 
-# Skip framework revision phase
-python3 agent_loop.py "Your question" --no-reframe
+# 跳过框架修正阶段
+python3 agent_loop.py "你的问题" --no-reframe
 
-# Custom timeout per agent call (default: 600s)
-python3 agent_loop.py "Your question" --timeout 900
+# 自定义每次 Agent 调用的超时时间（默认 600 秒）
+python3 agent_loop.py "你的问题" --timeout 900
 
-# Custom workspace directory
-python3 agent_loop.py "Your question" --workspace ./my-research
+# 自定义工作区目录
+python3 agent_loop.py "你的问题" --workspace ./my-research
 
-# Disable colored terminal output
-python3 agent_loop.py "Your question" --no-color
+# 禁用彩色输出
+python3 agent_loop.py "你的问题" --no-color
 
-# Pipe-friendly (no color, useful for logging)
-python3 agent_loop.py "Your question" --no-color 2>&1 | tee research.log
+# 管道友好模式（无颜色，适合日志记录）
+python3 agent_loop.py "你的问题" --no-color 2>&1 | tee research.log
 ```
 
-## Models
+## 模型配置
 
-| Agent | Model | Thinking |
-|-------|-------|----------|
-| Claude | Opus 4.6 | Extended thinking (high effort) |
-| Codex | GPT-5.3-Codex | Reasoning effort: high |
-| Gemini | Gemini 3.1 Pro | Thinking level: HIGH |
+| Agent | 模型 | 推理模式 |
+|-------|------|----------|
+| Claude | Opus 4.6 | 扩展思考（high effort） |
+| Codex | GPT-5.3-Codex | 推理努力度：high |
+| Gemini | Gemini 3.1 Pro | 思考级别：HIGH |
 
-Models are configured in the `call_*` functions in `agent_loop.py`. The script auto-configures Gemini's thinking settings in `~/.gemini/settings.json` on first run.
+模型配置在 `agent_loop.py` 的 `call_*` 函数中。脚本会在首次运行时自动配置 Gemini 的思考设置（`~/.gemini/settings.json`）。
 
-## Output
+## 输出
 
-### Terminal
-Each phase prints color-coded output in real-time (orange=Claude, green=Codex, blue=Gemini).
+### 终端
+每个阶段实时打印彩色输出（橙色=Claude，绿色=Codex，蓝色=Gemini）。
 
-### Workspace
-All intermediate results are saved to `~/agent-loop/workspace/{timestamp}/`:
+### 工作区
+所有中间结果保存到 `~/agent-loop/workspace/{时间戳}/`：
 
 ```
 workspace/20260302-143000/
-├── 00-question.md
-├── phase1-decomposition.md
-├── phase2-research-claude.md
-├── phase2-research-codex.md
-├── phase2-research-gemini.md
-├── phase3-review-*.md
-├── phase4-reframe.md
-├── phase5-synthesis.md
-├── phase6-briefing.md
-├── report.html
-└── full-log.md
+├── 00-question.md            # 原始研究问题
+├── phase1-decomposition.md   # 问题拆解结果
+├── phase2-research-claude.md # Claude 的研究发现
+├── phase2-research-codex.md  # Codex 的研究发现
+├── phase2-research-gemini.md # Gemini 的研究发现
+├── phase3-review-*.md        # 交叉审查结果
+├── phase3.5-evidence-audit.md# 证据审计报告
+├── phase4-reframe.md         # 框架修正评估
+├── phase5-synthesis.md       # 最终综合报告
+├── phase6-briefing.md        # 浓缩摘要
+├── report.html               # HTML 完整报告
+└── full-log.md               # 执行日志
 ```
 
-### HTML Report
-A styled HTML report is saved to `~/Desktop/` and auto-opened in the browser. The report has:
-- **Top half**: Condensed executive briefing (key takeaways in ~500 words)
-- **Bottom half**: Full research report with evidence and sources
+### HTML 报告
+格式化的 HTML 报告保存到 `~/Desktop/` 并自动在浏览器中打开：
+- **上半部分**：核心要点浓缩摘要（~500 字）
+- **下半部分**：完整研究报告（含证据和来源）
 
-## How It Differs from v1
+## v1 vs v2 对比
 
-v1 was a round-robin discussion — three LLMs taking turns writing paragraphs. Indistinguishable from asking one LLM to "analyze from multiple perspectives."
+v1 是轮流发言——三个大模型轮流写段落，和让一个模型"从多角度分析"没有本质区别。
 
-v2 is a research system:
+v2 是研究系统：
 
 | | v1 | v2 |
 |---|---|---|
-| What agents do | Share opinions | Research with tools |
-| Web search | No | Yes (all agents) |
-| Evidence | Training knowledge | Real-time citations |
-| Structure | Round-robin rounds | Phased pipeline |
-| Framework | Fixed | Can be revised mid-research |
-| Cross-validation | None | Agents verify each other's claims |
-| Output | Text in terminal | Terminal + workspace + HTML report |
+| Agent 做什么 | 分享观点 | 用工具做研究 |
+| 网络搜索 | 无 | 全部启用 |
+| 证据来源 | 训练数据 | 实时引用 |
+| 结构 | 轮流发言 | 分阶段流水线 |
+| 框架 | 固定不变 | 可在研究中修正 |
+| 交叉验证 | 无 | Agent 互相验证引用 |
+| 证据审计 | 无 | Claude 审计所有来源并标记虚假信息 |
+| 输出 | 终端文本 | 终端 + 工作区 + HTML 报告 |
 
-## License
+## 许可证
 
 MIT

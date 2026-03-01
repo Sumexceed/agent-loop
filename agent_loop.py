@@ -3,11 +3,13 @@
 Agent Loop v2: Collaborative Research System
 
 Three AI agents (Claude, Codex, Gemini) collaborate through structured phases:
-  1. DECOMPOSE — break the question into researchable sub-questions
-  2. RESEARCH  — each agent independently researches assigned sub-questions (with tools)
-  3. CHALLENGE — cross-review each other's findings
-  4. REFRAME   — revise the framework if needed, then do supplementary research
-  5. SYNTHESIZE — produce the final research report
+  1.   DECOMPOSE      — break the question into researchable sub-questions
+  2.   RESEARCH       — each agent independently researches assigned sub-questions (with tools)
+  3.   CHALLENGE      — cross-review each other's findings
+  3.5  EVIDENCE AUDIT — Claude audits evidence quality (verifies sources, flags fabrications)
+  4.   REFRAME        — revise the framework if needed, then do supplementary research
+  5.   SYNTHESIZE     — produce the final research report
+  6.   REPORT         — generate HTML report with executive briefing
 
 Usage:
     python3 agent_loop.py "your research question"
@@ -248,7 +250,8 @@ You MUST use web search to do your verification. Don't just critique from intuit
 
 REFRAME_PROMPT = """\
 You are a research architect. Three researchers have independently investigated \
-sub-questions of a larger research question, and their work has been cross-reviewed.
+sub-questions of a larger research question, and their work has been cross-reviewed \
+and the evidence has been audited.
 
 ## Original Research Question
 {question}
@@ -262,14 +265,21 @@ sub-questions of a larger research question, and their work has been cross-revie
 ## Cross-Review Results
 {reviews}
 
+## Evidence Audit Results
+{audit}
+
 ## Your Task
-Evaluate whether the original research framework is adequate:
+Evaluate whether the original research framework is adequate. \
+Pay special attention to the evidence audit — areas flagged as FABRICATED or \
+UNVERIFIABLE should be treated as gaps that need to be addressed.
 
 1. Were the right sub-questions asked? Or did the research reveal that the \
 problem should be framed differently?
 2. Are there critical gaps that no sub-question addressed?
 3. Did any findings contradict the premises of the original question?
 4. Are there new sub-questions that emerged from the research?
+5. Did the evidence audit reveal areas where claims lack reliable support \
+and supplementary research is needed?
 
 ## Output Format
 First give your analysis, then:
@@ -300,6 +310,9 @@ You are a research synthesizer producing a final report.
 ## Cross-Review Results
 {reviews}
 
+## Evidence Audit Results
+{audit}
+
 ## Framework Assessment
 {reframe}
 
@@ -313,13 +326,73 @@ and sources found during research.
 3. **Points of Consensus** — where all researchers agreed, with supporting evidence.
 4. **Contested Areas** — where evidence is contradictory or researchers disagreed, \
 explaining both sides.
-5. **Evidence Quality** — assessment of the overall evidence base. \
-What is well-established vs. uncertain?
+5. **Evidence Quality** — incorporate the evidence audit results. For each key finding, \
+indicate whether the supporting evidence was VERIFIED, PARTIALLY VERIFIED, \
+UNVERIFIABLE, or FABRICATED. Exclude or clearly flag any claims that were found \
+to be fabricated during the audit. Do not present unverified claims as established facts.
 6. **Open Questions** — what remains unanswered and would need further research.
-7. **Sources** — consolidated list of key sources used.
+7. **Sources** — consolidated list of key sources used, with verification status from the audit.
 
 Ground every claim in evidence found during the research phases. \
-If something wasn't verified through research, say so explicitly.
+If something wasn't verified through research or was flagged in the audit, say so explicitly. \
+The evidence audit is your primary guide for what to trust and what to qualify.
+"""
+
+EVIDENCE_AUDIT_PROMPT = """\
+You are an evidence auditor. Your sole job is to assess the quality and reliability \
+of evidence gathered during a research process. You are rigorous, skeptical, and fair.
+
+## Original Research Question
+{question}
+
+## Research Findings (from three agents)
+{research}
+
+## Cross-Review Results (agents reviewed each other's work)
+{reviews}
+
+## Your Task
+Systematically audit the evidence quality across ALL research findings and reviews.
+
+For EACH significant claim or data point cited in the research:
+1. **Verify the source** — Use web search to check if the cited URL or source actually exists \
+and contains the claimed information. Flag any broken links or misattributed sources.
+2. **Check accuracy** — Does the source actually say what the researcher claims? \
+Are numbers quoted correctly? Is context preserved or distorted?
+3. **Assess reliability** — Rate each key piece of evidence:
+   - ✅ VERIFIED: Source confirmed, claim accurate
+   - ⚠️ PARTIALLY VERIFIED: Source exists but claim is somewhat distorted or oversimplified
+   - ❌ UNVERIFIABLE: Cannot find the cited source or confirm the claim
+   - 🚫 FABRICATED: Source does not exist, or says something materially different
+
+4. **Cross-check contradictions** — Where different agents cited conflicting data, \
+determine which version is better supported.
+
+## Output Format
+
+### Evidence Inventory
+For each major claim, list:
+- Claim summary
+- Cited source
+- Verification result (✅/⚠️/❌/🚫)
+- Notes
+
+### Reliability Summary
+- Total claims audited: N
+- Verified: N
+- Partially verified: N
+- Unverifiable: N
+- Fabricated: N
+
+### Critical Flags
+List any evidence that is fabricated, seriously distorted, or where the conclusion \
+drawn from the evidence is not supported by the actual source.
+
+### Overall Evidence Quality Assessment
+A brief paragraph assessing the overall reliability of the evidence base, \
+noting which areas of the research are well-supported and which are shaky.
+
+Be thorough. You must actually search and verify — do not rubber-stamp claims.
 """
 
 CONDENSED_PROMPT = """\
@@ -780,11 +853,50 @@ def phase_challenge(
     return results
 
 
+def phase_evidence_audit(
+    question: str,
+    research: dict[str, str],
+    reviews: dict[str, str],
+    palette: dict,
+    ws: Workspace,
+    timeout: int,
+) -> str:
+    """Phase 3.5: Claude audits evidence quality across all research and reviews."""
+    print(f"{c('phase', '═══ Phase 3.5: EVIDENCE AUDIT ═══', palette)}")
+    print(f"{palette['dim']}Claude is auditing evidence quality (verifying sources, checking claims)...{palette['reset']}\n")
+
+    research_text = "\n\n---\n\n".join(
+        f"### {name}\n{text}" for name, text in research.items()
+    )
+    review_text = "\n\n---\n\n".join(
+        f"### {name}\n{text}" for name, text in reviews.items()
+    )
+
+    prompt = EVIDENCE_AUDIT_PROMPT.format(
+        question=question,
+        research=research_text,
+        reviews=review_text,
+    )
+
+    print(f"  {c('Claude', '[Claude]', palette)} {palette['dim']}auditing evidence...{palette['reset']}", end="", flush=True)
+    response = call_claude(prompt, timeout=timeout)
+
+    ws.save("phase3.5-evidence-audit.md", response)
+    ws.log("Phase 3.5 complete: evidence audit")
+
+    print(f"\r  {c('Claude', '[Claude]', palette)} audit complete\n")
+    print(response)
+    print()
+
+    return response
+
+
 def phase_reframe(
     question: str,
     decomposition: str,
     research: dict[str, str],
     reviews: dict[str, str],
+    audit_text: str,
     palette: dict,
     ws: Workspace,
     timeout: int,
@@ -805,6 +917,7 @@ def phase_reframe(
         decomposition=decomposition,
         research=research_text,
         reviews=review_text,
+        audit=audit_text,
     )
 
     print(f"  {c('Gemini', '[Gemini]', palette)} {palette['dim']}evaluating framework...{palette['reset']}", end="", flush=True)
@@ -825,6 +938,7 @@ def phase_synthesize(
     question: str,
     research: dict[str, str],
     reviews: dict[str, str],
+    audit_text: str,
     reframe_text: str,
     palette: dict,
     ws: Workspace,
@@ -844,6 +958,7 @@ def phase_synthesize(
         question=question,
         research=research_text,
         reviews=review_text,
+        audit=audit_text,
         reframe=reframe_text,
     )
 
@@ -995,13 +1110,24 @@ def main():
         args.question, all_research, palette, ws, args.timeout
     )
 
+    # ── Phase 3.5: Evidence Audit (Claude) ──
+    audit_text = ""
+    try:
+        audit_text = phase_evidence_audit(
+            args.question, all_research, all_reviews,
+            palette, ws, args.timeout,
+        )
+    except Exception as e:
+        print(f"  {palette['dim']}Phase 3.5 error: {e} — continuing without audit{palette['reset']}\n")
+        ws.log(f"Phase 3.5 FAILED: {e}")
+
     # ── Phase 4: Reframe ──
     reframe_text = ""
     if not args.no_reframe:
         try:
             status, reframe_text = phase_reframe(
                 args.question, decomposition_text, all_research, all_reviews,
-                palette, ws, args.timeout,
+                audit_text, palette, ws, args.timeout,
             )
             if status == "REVISE":
                 print(f"{palette['bold']}Framework revision triggered — running supplementary research...{palette['reset']}\n")
@@ -1018,7 +1144,7 @@ def main():
     synthesis = ""
     try:
         synthesis = phase_synthesize(
-            args.question, all_research, all_reviews, reframe_text,
+            args.question, all_research, all_reviews, audit_text, reframe_text,
             palette, ws, args.timeout,
         )
     except Exception as e:
