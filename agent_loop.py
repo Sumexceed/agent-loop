@@ -2,18 +2,21 @@
 """
 Agent Loop v2: Collaborative Research System
 
-Three AI agents (Claude, Codex, Gemini) collaborate through structured phases:
+Two AI agents (Claude, Gemini) collaborate through structured phases:
   1.   DECOMPOSE      — break the question into researchable sub-questions
   2.   RESEARCH       — each agent independently researches assigned sub-questions (with tools)
   3.   CHALLENGE      — cross-review each other's findings
   3.5  EVIDENCE AUDIT — Claude audits evidence quality (verifies sources, flags fabrications)
-  4.   REFRAME        — revise the framework if needed, then do supplementary research
+  3.6  REPAIR         — targeted re-research on flagged claims → challenge → re-audit
+  4.   REFRAME        — revise the framework if needed → supplementary research + challenge + audit
   5.   SYNTHESIZE     — produce the final research report
+  5.5  GAP ANALYSIS   — identify researchable blind spots → gap research + challenge + audit → re-synthesize
   6.   REPORT         — generate HTML report with executive briefing
 
 Usage:
     python3 agent_loop.py "your research question"
     python3 agent_loop.py "your question" --no-reframe
+    python3 agent_loop.py "your question" --no-gap-research
     python3 agent_loop.py "your question" --workspace ./my-research
 """
 
@@ -37,7 +40,6 @@ from pathlib import Path
 
 COLORS = {
     "Claude": "\033[38;5;208m",
-    "Codex": "\033[38;5;48m",
     "Gemini": "\033[38;5;75m",
     "phase": "\033[38;5;141m",
     "summary": "\033[38;5;226m",
@@ -56,14 +58,47 @@ def c(name: str, text: str, palette: dict) -> str:
 # CLI callers — with tool permissions enabled for real research
 # ---------------------------------------------------------------------------
 
+def _parse_stream_json(raw: str) -> str:
+    """Extract ALL assistant text blocks from Claude stream-json output.
+
+    When Claude uses tools, it may produce text across multiple turns:
+      turn 1: [text A] + [tool_use]      ← text A is the main research
+      turn 2: [text B] + [tool_use]      ← text B continues the analysis
+      turn 3: [text C]                   ← text C is "Research complete..."
+
+    --output-format text / json only returns the LAST turn's text (C),
+    losing the actual research content (A + B).  stream-json gives us
+    every message, so we concatenate all assistant text blocks.
+    """
+    text_parts: list[str] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") != "assistant":
+            continue
+        content_blocks = obj.get("message", {}).get("content", [])
+        for block in content_blocks:
+            if block.get("type") == "text":
+                text = block.get("text", "").strip()
+                if text:
+                    text_parts.append(text)
+    return "\n\n".join(text_parts).strip() if text_parts else raw.strip()
+
+
 def call_claude(prompt: str, timeout: int = 600) -> str:
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
     result = subprocess.run(
         [
             "claude", "-p",
+            "--verbose",
             "--model", "claude-opus-4-6",
             "--effort", "high",
-            "--output-format", "text",
+            "--output-format", "stream-json",
             "--allowedTools", "WebSearch,WebFetch,Read,Bash(grep:*),Bash(curl:*),Grep,Glob",
         ],
         input=prompt,
@@ -74,26 +109,7 @@ def call_claude(prompt: str, timeout: int = 600) -> str:
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"claude exit {result.returncode}")
-    return result.stdout.strip()
-
-
-def call_codex(prompt: str, timeout: int = 600) -> str:
-    result = subprocess.run(
-        [
-            "codex", "exec",
-            "--skip-git-repo-check",
-            "--full-auto",
-            "-m", "gpt-5.3-codex",
-            "-c", 'model_reasoning_effort="high"',
-        ],
-        input=prompt,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or f"codex exit {result.returncode}")
-    return result.stdout.strip()
+    return _parse_stream_json(result.stdout)
 
 
 def _ensure_gemini_thinking_config():
@@ -138,7 +154,6 @@ def call_gemini(prompt: str, timeout: int = 600) -> str:
 
 AGENTS = {
     "Claude": call_claude,
-    "Codex": call_codex,
     "Gemini": call_gemini,
 }
 
@@ -181,7 +196,7 @@ what dimensions it spans.
 researched using web searches, data analysis, or literature review.
 3. For each sub-question, suggest what kind of evidence would be needed \
 (data, case studies, expert opinions, academic papers, etc.).
-4. Assign each sub-question to one of three researchers: Agent-A, Agent-B, Agent-C. \
+4. Assign each sub-question to one of two researchers: Agent-A, Agent-B. \
 Distribute the workload roughly evenly.
 
 ## Output Format (follow strictly)
@@ -194,10 +209,7 @@ EVIDENCE: <what evidence to look for>
 [B1] <sub-question text>
 EVIDENCE: <what evidence to look for>
 ---
-[C1] <sub-question text>
-EVIDENCE: <what evidence to look for>
----
-(continue as needed with A2, B2, C2, etc.)
+(continue as needed with A2, B2, etc.)
 SUB_QUESTIONS_END
 """
 
@@ -249,7 +261,7 @@ You MUST use web search to do your verification. Don't just critique from intuit
 """
 
 REFRAME_PROMPT = """\
-You are a research architect. Three researchers have independently investigated \
+You are a research architect. Two researchers have independently investigated \
 sub-questions of a larger research question, and their work has been cross-reviewed \
 and the evidence has been audited.
 
@@ -289,12 +301,15 @@ FRAMEWORK_STATUS: ADEQUATE
 
 If revision is needed, write:
 FRAMEWORK_STATUS: REVISE
-Then list new sub-questions in the same format as Phase 1:
+Then list new sub-questions using ONLY keys A and B (the two researcher IDs):
 SUB_QUESTIONS_START
 [A1] <new sub-question>
 EVIDENCE: <what to look for>
 ---
-(etc.)
+[B1] <new sub-question>
+EVIDENCE: <what to look for>
+---
+(etc. — always use A or B followed by a number)
 SUB_QUESTIONS_END
 """
 
@@ -338,6 +353,69 @@ If something wasn't verified through research or was flagged in the audit, say s
 The evidence audit is your primary guide for what to trust and what to qualify.
 """
 
+GAP_ANALYSIS_PROMPT = """\
+You are an independent research gap analyst. You have NOT participated in the research \
+process — you are reviewing the final synthesis report with fresh eyes to identify \
+what important questions remain unanswered.
+
+## Original Research Question
+{question}
+
+## Synthesis Report
+{synthesis}
+
+## Your Task
+1. Extract ALL open questions, blind spots, and acknowledged gaps from the synthesis report \
+(look in "Open Questions", "Limitations", "Further Research Needed", or similar sections, \
+as well as hedged statements throughout the report).
+
+2. For EACH gap, classify it as:
+   - **RESEARCHABLE** — can likely be answered (even partially) through public information: \
+web searches, financial databases, news articles, regulatory filings, industry reports, \
+analyst commentary, company disclosures, academic papers, etc.
+   - **NON_PUBLIC** — requires proprietary data, internal company information, classified data, \
+or access that public web searches cannot provide.
+
+3. Classification guideline: **When in doubt, classify as RESEARCHABLE.** \
+It is better to attempt a search and find nothing than to skip a gap that could have been filled.
+
+4. For each RESEARCHABLE gap, formulate 1-2 specific, actionable sub-questions using \
+the [A1]/[B1] format (A=Claude, B=Gemini). Distribute questions roughly evenly between A and B.
+
+## Output Format
+
+### Gap Analysis
+
+For each gap:
+- **Gap**: <description>
+- **Classification**: RESEARCHABLE / NON_PUBLIC
+- **Reasoning**: <why this classification>
+- **Sub-questions** (if RESEARCHABLE):
+  [A/B + number] <specific search question>
+
+### Summary
+- Total gaps identified: N
+- Researchable: N
+- Non-public: N
+
+### Sub-Questions for Gap Research
+If there are researchable gaps, list all sub-questions in the standard format:
+
+SUB_QUESTIONS_START
+[A1] <sub-question>
+EVIDENCE: <what to search for>
+---
+[B1] <sub-question>
+EVIDENCE: <what to search for>
+---
+(etc.)
+SUB_QUESTIONS_END
+
+At the end, write exactly one of:
+GAPS_STATUS: RESEARCH_NEEDED
+GAPS_STATUS: NO_RESEARCHABLE_GAPS
+"""
+
 EVIDENCE_AUDIT_PROMPT = """\
 You are an evidence auditor. Your sole job is to assess the quality and reliability \
 of evidence gathered during a research process. You are rigorous, skeptical, and fair.
@@ -345,7 +423,7 @@ of evidence gathered during a research process. You are rigorous, skeptical, and
 ## Original Research Question
 {question}
 
-## Research Findings (from three agents)
+## Research Findings (from two agents)
 {research}
 
 ## Cross-Review Results (agents reviewed each other's work)
@@ -395,6 +473,81 @@ noting which areas of the research are well-supported and which are shaky.
 Be thorough. You must actually search and verify — do not rubber-stamp claims.
 """
 
+REPAIR_PROMPT = """\
+You are a research repair agent. An independent evidence audit has identified claims \
+in prior research that are fabricated, unverifiable, or inaccurate. \
+Your job is to find REAL, verifiable evidence to replace the problematic claims.
+
+## Original Research Question
+{question}
+
+## Evidence Audit Report (identifying problematic claims)
+{audit}
+
+## Your Task
+Focus on claims marked as ❌ UNVERIFIABLE or 🚫 FABRICATED in the audit above.
+
+For each problematic claim:
+1. **Search** — conduct web searches to find real, verifiable evidence on the same topic
+2. **Replace** — if the original claim is wrong, report what the actual facts are
+3. **Confirm absence** — if no evidence exists on the topic, explicitly state \
+"no verifiable evidence found" rather than fabricating a substitute
+4. **Cite** — provide URLs and specific source names for everything you find
+5. **Deepen** — for claims marked ⚠️ PARTIALLY VERIFIED, search for stronger \
+supporting evidence or clarify the distortion
+
+Do NOT repeat or defend the original fabricated claims. Your goal is truth, \
+not confirmation.
+
+Structure your output by listing each problematic claim and your findings.
+"""
+
+POLISH_REPORT_PROMPT = """\
+You are a senior research analyst producing a client-facing report. \
+You have received an internal working document from your research team. \
+Your job is to rewrite it into a polished, authoritative research report \
+suitable for external stakeholders (investors, executives, board members).
+
+## Internal Research Document
+{synthesis}
+
+## Rewriting Rules
+
+1. **Remove all internal process artifacts:**
+   - No audit tags: [VERIFIED], [PARTIALLY VERIFIED], [FABRICATED], ✅, ⚠️, ❌, 🚫
+   - No internal labels: "发现1", "发现2", evidence inventory tables, reliability summaries
+   - No references to "researchers", "agents", "auditors", "cross-review", or "the audit found..."
+   - No meta-commentary about the research process itself
+
+2. **Restructure around the reader's questions, not the research process:**
+   - Lead with the answer, then support it with evidence
+   - Group findings by theme (growth drivers, risks, valuation) not by discovery order
+   - Each section should build a clear argument, not list disconnected data points
+
+3. **Handle uncertainty with professional language:**
+   - Instead of "[UNVERIFIABLE]" → "Management has not disclosed..." or "Public data is insufficient to confirm..."
+   - Instead of "[PARTIALLY VERIFIED]" → state what is confirmed and what the caveat is, in plain prose
+   - Silently drop claims that were found to be fabricated — do not include them at all
+   - Where data conflicts exist, present the most reliable figure and note the discrepancy briefly
+
+4. **Maintain intellectual rigor without the scaffolding:**
+   - Keep all verified data points, statistics, and sourced claims
+   - Preserve nuance and opposing views — but present them as "on the other hand" analysis, \
+not as "Agent A said X, Agent B disagreed"
+   - Sources should appear as inline citations or a references section, not as audit trails
+
+5. **Structure:**
+   - **Executive Summary** (2-3 paragraphs answering the core question)
+   - **Thematic sections** (3-5 sections, each with a clear heading that telegraphs the conclusion)
+   - **Risk Factors** (consolidated, not scattered across the report)
+   - **Outlook & Open Questions** (brief — only genuinely unanswerable questions, not process gaps)
+   - **Key Sources** (clean list, no verification status tags)
+
+6. **Tone:** Authoritative, concise, data-driven. \
+Write as if publishing in an equity research note or a strategy consulting deliverable. \
+Write in the same language as the internal document.
+"""
+
 CONDENSED_PROMPT = """\
 You are an expert editor. Given the following research report, produce a \
 **condensed executive briefing** in markdown format.
@@ -431,7 +584,6 @@ HTML_TEMPLATE = """\
     --highlight-bg: #f0f7ff;
     --highlight-border: #2563eb;
     --claude: #e87b35;
-    --codex: #22c55e;
     --gemini: #3b82f6;
   }}
   @media (prefers-color-scheme: dark) {{
@@ -485,7 +637,6 @@ HTML_TEMPLATE = """\
     font-weight: 500;
   }}
   .agent-claude {{ background: rgba(232,123,53,0.2); color: #f6a56c; }}
-  .agent-codex  {{ background: rgba(34,197,94,0.2);  color: #6ee7a0; }}
   .agent-gemini {{ background: rgba(59,130,246,0.2); color: #93bbfc; }}
   .container {{
     max-width: 860px;
@@ -631,7 +782,6 @@ HTML_TEMPLATE = """\
   <div class="meta">{date} &middot; Agent Loop v2 &middot; Collaborative Research</div>
   <div class="agents">
     <span class="agent-claude">Claude</span>
-    <span class="agent-codex">Codex</span>
     <span class="agent-gemini">Gemini</span>
   </div>
 </div>
@@ -649,7 +799,7 @@ HTML_TEMPLATE = """\
 </div>
 
 <div class="footer">
-  Generated by Agent Loop v2 &mdash; Claude + Codex + Gemini collaborative research<br>
+  Generated by Agent Loop v2 &mdash; Claude + Gemini collaborative research<br>
   Elapsed: {elapsed}
 </div>
 
@@ -670,19 +820,39 @@ document.getElementById('report-content').innerHTML = marked.parse(reportMd);
 # ---------------------------------------------------------------------------
 
 def parse_sub_questions(text: str) -> dict[str, list[str]]:
-    """Parse sub-questions from decomposition output, grouped by agent."""
-    assignments: dict[str, list[str]] = {"A": [], "B": [], "C": []}
+    """Parse sub-questions from decomposition output, grouped by agent.
+
+    Accepts any uppercase letter as agent key (A-Z).  Standard keys
+    A/B are kept as-is.  Non-standard keys (C, D, …) are distributed
+    round-robin among A/B so each agent gets a roughly equal share.
+    """
+    CANONICAL = ["A", "B"]
+    assignments: dict[str, list[str]] = {"A": [], "B": []}
+    # Counter for round-robin distribution of non-standard keys
+    _rr_idx = 0
+
+    def _map_key(raw: str) -> str:
+        nonlocal _rr_idx
+        raw = raw.upper()
+        if raw in CANONICAL:
+            return raw
+        # Non-standard key → distribute round-robin
+        target = CANONICAL[_rr_idx % len(CANONICAL)]
+        _rr_idx += 1
+        return target
+
     match = re.search(r"SUB_QUESTIONS_START\s*\n(.*?)SUB_QUESTIONS_END", text, re.DOTALL)
     if not match:
         # Fallback: try to extract numbered questions
         lines = text.strip().split("\n")
-        qs = [l.strip() for l in lines if re.match(r"\[?[ABC]\d\]?", l.strip())]
+        qs = [l.strip() for l in lines if re.match(r"\[?[A-Z]\d\]?", l.strip())]
         if not qs:
             # Last resort: treat the whole output as a single question for each agent
-            return {"A": [text], "B": [], "C": []}
+            return {"A": [text], "B": []}
         for q in qs:
             agent = q[1] if q.startswith("[") else q[0]
-            assignments.setdefault(agent.upper(), []).append(q)
+            mapped = _map_key(agent)
+            assignments[mapped].append(q)
         return assignments
 
     block = match.group(1)
@@ -691,9 +861,10 @@ def parse_sub_questions(text: str) -> dict[str, list[str]]:
         entry = entry.strip()
         if not entry:
             continue
-        m = re.match(r"\[([ABC])\d\]", entry)
+        m = re.match(r"\[([A-Z])\d\]", entry)
         if m:
-            assignments[m.group(1)].append(entry)
+            mapped = _map_key(m.group(1))
+            assignments[mapped].append(entry)
     return assignments
 
 
@@ -701,6 +872,12 @@ def parse_framework_status(text: str) -> str:
     if "FRAMEWORK_STATUS: REVISE" in text:
         return "REVISE"
     return "ADEQUATE"
+
+
+def parse_gaps_status(text: str) -> str:
+    if "GAPS_STATUS: RESEARCH_NEEDED" in text:
+        return "RESEARCH_NEEDED"
+    return "NO_RESEARCHABLE_GAPS"
 
 
 def run_agent(name: str, prompt: str, timeout: int) -> tuple[str, str]:
@@ -727,7 +904,7 @@ def phase_decompose(question: str, palette: dict, ws: Workspace, timeout: int) -
     print()
 
     # Show assignment summary
-    agent_map = {"A": "Claude", "B": "Codex", "C": "Gemini"}
+    agent_map = {"A": "Claude", "B": "Gemini"}
     for key, qs in assignments.items():
         if qs:
             name = agent_map[key]
@@ -749,7 +926,7 @@ def phase_research(
     print(f"{c('phase', f'═══ {label} ═══', palette)}")
     print(f"{palette['dim']}Agents are researching in parallel (with web search enabled)...{palette['reset']}\n")
 
-    agent_map = {"A": "Claude", "B": "Codex", "C": "Gemini"}
+    agent_map = {"A": "Claude", "B": "Gemini"}
     results: dict[str, str] = {}
 
     # Build per-agent prompts
@@ -767,7 +944,7 @@ def phase_research(
         print(f"  {c(name, f'[{name}]', palette)} {palette['dim']}researching...{palette['reset']}")
 
     # Parallel execution
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {
             executor.submit(run_agent, name, prompt, timeout): name
             for name, prompt in tasks
@@ -800,11 +977,14 @@ def phase_challenge(
     palette: dict,
     ws: Workspace,
     timeout: int,
+    tag: str = "",
 ) -> dict[str, str]:
-    print(f"{c('phase', '═══ Phase 3: CHALLENGE ═══', palette)}")
+    label = f"Phase 3{tag}: CHALLENGE"
+    file_prefix = f"phase3{tag.replace(' ', '')}"
+    print(f"{c('phase', f'═══ {label} ═══', palette)}")
     print(f"{palette['dim']}Cross-reviewing findings (with verification searches)...{palette['reset']}\n")
 
-    # Rotation: Claude reviews Codex, Codex reviews Gemini, Gemini reviews Claude
+    # Cross-review: Claude reviews Gemini, Gemini reviews Claude
     names = list(research.keys())
     if len(names) < 2:
         print(f"  {palette['dim']}Not enough agents to cross-review, skipping.{palette['reset']}\n")
@@ -827,7 +1007,7 @@ def phase_challenge(
         tasks.append((reviewer, prompt))
         print(f"  {c(reviewer, f'[{reviewer}]', palette)} {palette['dim']}reviewing {target}'s work...{palette['reset']}")
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {
             executor.submit(run_agent, name, prompt, timeout): (name, review_pairs[i][1])
             for i, (name, prompt) in enumerate(tasks)
@@ -837,11 +1017,11 @@ def phase_challenge(
             try:
                 _, response = future.result()
                 results[name] = response
-                ws.save(f"phase3-review-{name.lower()}-of-{target.lower()}.md", response)
-                ws.log(f"Phase 3: {name}'s review of {target} complete")
+                ws.save(f"{file_prefix}-review-{name.lower()}-of-{target.lower()}.md", response)
+                ws.log(f"{label}: {name}'s review of {target} complete")
             except Exception as e:
                 print(f"  {c(name, f'[{name}]', palette)} {palette['dim']}⚠ error: {e}{palette['reset']}")
-                ws.log(f"Phase 3: {name} FAILED: {e}")
+                ws.log(f"{label}: {name} FAILED: {e}")
 
     for name, response in results.items():
         target = [t for r, t in review_pairs if r == name][0]
@@ -860,9 +1040,12 @@ def phase_evidence_audit(
     palette: dict,
     ws: Workspace,
     timeout: int,
+    tag: str = "",
 ) -> str:
-    """Phase 3.5: Claude audits evidence quality across all research and reviews."""
-    print(f"{c('phase', '═══ Phase 3.5: EVIDENCE AUDIT ═══', palette)}")
+    """Claude audits evidence quality across all research and reviews."""
+    label = f"Phase 3.5{tag}: EVIDENCE AUDIT"
+    file_name = f"phase3.5{tag.replace(' ', '')}-evidence-audit.md"
+    print(f"{c('phase', f'═══ {label} ═══', palette)}")
     print(f"{palette['dim']}Claude is auditing evidence quality (verifying sources, checking claims)...{palette['reset']}\n")
 
     research_text = "\n\n---\n\n".join(
@@ -881,14 +1064,76 @@ def phase_evidence_audit(
     print(f"  {c('Claude', '[Claude]', palette)} {palette['dim']}auditing evidence...{palette['reset']}", end="", flush=True)
     response = call_claude(prompt, timeout=timeout)
 
-    ws.save("phase3.5-evidence-audit.md", response)
-    ws.log("Phase 3.5 complete: evidence audit")
+    ws.save(file_name, response)
+    ws.log(f"{label} complete")
 
     print(f"\r  {c('Claude', '[Claude]', palette)} audit complete\n")
     print(response)
     print()
 
     return response
+
+
+def audit_has_issues(audit_text: str) -> bool:
+    """Check if audit found fabricated or unverifiable claims worth repairing."""
+    markers = ["🚫", "FABRICATED", "❌", "UNVERIFIABLE"]
+    return any(m in audit_text for m in markers)
+
+
+def phase_repair(
+    question: str,
+    audit_text: str,
+    palette: dict,
+    ws: Workspace,
+    timeout: int,
+) -> tuple[dict[str, str], dict[str, str], str]:
+    """Phase 3.6: Repair — targeted re-research, cross-review, and re-audit."""
+    print(f"{c('phase', '═══ Phase 3.6: REPAIR ═══', palette)}")
+    print(f"{palette['dim']}Targeted re-research on audit-flagged issues...{palette['reset']}\n")
+
+    # Step 1: Both agents do targeted repair research in parallel
+    repair_prompt = REPAIR_PROMPT.format(question=question, audit=audit_text)
+
+    repair_research: dict[str, str] = {}
+    agent_names = ["Claude", "Gemini"]
+    tasks = [(name, repair_prompt) for name in agent_names]
+
+    for name in agent_names:
+        print(f"  {c(name, f'[{name}]', palette)} {palette['dim']}repairing evidence...{palette['reset']}")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {
+            executor.submit(run_agent, name, prompt, timeout): name
+            for name, prompt in tasks
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                _, response = future.result()
+                repair_research[name] = response
+                ws.save(f"phase3.6-repair-{name.lower()}.md", response)
+                ws.log(f"Phase 3.6: {name} repair complete")
+            except Exception as e:
+                print(f"  {c(name, f'[{name}]', palette)} {palette['dim']}⚠ error: {e}{palette['reset']}")
+                ws.log(f"Phase 3.6: {name} FAILED: {e}")
+
+    for name, response in repair_research.items():
+        print(f"\n{'─' * 50}")
+        print(f"{c(name, f'[{name} Repair]', palette)}\n")
+        print(response)
+    print()
+
+    # Step 2: Cross-review repair findings
+    repair_reviews = phase_challenge(
+        question, repair_research, palette, ws, timeout, tag=" (repair)"
+    )
+
+    # Step 3: Re-audit (repair findings only)
+    repair_audit = phase_evidence_audit(
+        question, repair_research, repair_reviews, palette, ws, timeout, tag=" (repair)"
+    )
+
+    return repair_research, repair_reviews, repair_audit
 
 
 def phase_reframe(
@@ -978,6 +1223,36 @@ def phase_synthesize(
     return response
 
 
+def phase_gap_analysis(
+    question: str,
+    synthesis: str,
+    palette: dict,
+    ws: Workspace,
+    timeout: int,
+) -> tuple[str, str]:
+    """Phase 5.5: Gemini analyzes gaps in the synthesis report.
+
+    Returns (status, response) where status is RESEARCH_NEEDED or NO_RESEARCHABLE_GAPS.
+    """
+    print(f"{c('phase', '═══ Phase 5.5: GAP ANALYSIS ═══', palette)}")
+    print(f"{palette['dim']}Gemini is analyzing research blind spots...{palette['reset']}\n")
+
+    prompt = GAP_ANALYSIS_PROMPT.format(question=question, synthesis=synthesis)
+
+    print(f"  {c('Gemini', '[Gemini]', palette)} {palette['dim']}analyzing gaps...{palette['reset']}", end="", flush=True)
+    response = call_gemini(prompt, timeout=timeout)
+    status = parse_gaps_status(response)
+
+    ws.save("phase5.5-gap-analysis.md", response)
+    ws.log(f"Phase 5.5 complete: gaps status = {status}")
+
+    print(f"\r  {c('Gemini', '[Gemini]', palette)} verdict: {palette['bold']}{status}{palette['reset']}\n")
+    print(response)
+    print()
+
+    return status, response
+
+
 def phase_report(
     question: str,
     synthesis: str,
@@ -990,9 +1265,21 @@ def phase_report(
     print(f"{c('phase', '═══ Phase 6: REPORT ═══', palette)}")
     print(f"{palette['dim']}Generating HTML report...{palette['reset']}\n")
 
-    # Step 1: Generate condensed briefing
+    # Step 1: Polish the internal synthesis into a client-facing report
+    print(f"  {c('Claude', '[Claude]', palette)} {palette['dim']}polishing report...{palette['reset']}", end="", flush=True)
+    polish_prompt = POLISH_REPORT_PROMPT.format(synthesis=synthesis)
+    try:
+        polished = call_claude(polish_prompt, timeout=timeout)
+        ws.save("phase6-polished-report.md", polished)
+        ws.log("Phase 6: polished report generated")
+        print(f"\r  {c('Claude', '[Claude]', palette)} polished report ready")
+    except Exception as e:
+        print(f"\r  {c('Claude', '[Claude]', palette)} {palette['dim']}⚠ polish failed: {e} — using raw synthesis{palette['reset']}")
+        polished = synthesis
+
+    # Step 2: Generate condensed briefing (from polished report)
     print(f"  {c('Claude', '[Claude]', palette)} {palette['dim']}condensing key takeaways...{palette['reset']}", end="", flush=True)
-    condensed_prompt = CONDENSED_PROMPT.format(report=synthesis)
+    condensed_prompt = CONDENSED_PROMPT.format(report=polished)
     try:
         briefing = call_claude(condensed_prompt, timeout=timeout)
     except Exception as e:
@@ -1003,7 +1290,7 @@ def phase_report(
     ws.log("Phase 6: briefing generated")
     print(f"\r  {c('Claude', '[Claude]', palette)} briefing ready")
 
-    # Step 2: Build HTML
+    # Step 3: Build HTML
     date_str = datetime.now().strftime("%Y-%m-%d")
     title_escaped = html.escape(question)
 
@@ -1012,7 +1299,7 @@ def phase_report(
         date=date_str,
         elapsed=elapsed_str,
         briefing_json=json.dumps(briefing, ensure_ascii=False),
-        report_json=json.dumps(synthesis, ensure_ascii=False),
+        report_json=json.dumps(polished, ensure_ascii=False),
     )
 
     # Step 3: Save to Desktop
@@ -1049,13 +1336,15 @@ def phase_report(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Agent Loop v2: Three AI agents collaboratively research a question."
+        description="Agent Loop v2: Two AI agents (Claude + Gemini) collaboratively research a question."
     )
     parser.add_argument("question", help="The research question to investigate")
     parser.add_argument("--timeout", type=int, default=600,
                         help="Timeout per agent call in seconds (default: 600)")
     parser.add_argument("--no-reframe", action="store_true",
                         help="Skip the framework revision phase")
+    parser.add_argument("--no-gap-research", action="store_true",
+                        help="Skip the gap analysis phase")
     parser.add_argument("--no-color", action="store_true",
                         help="Disable colored output")
     parser.add_argument("--workspace", type=str, default=None,
@@ -1081,7 +1370,7 @@ def main():
     print(f"{'═' * 60}{palette['reset']}")
     print(f"{palette['dim']}Question:  {args.question}")
     print(f"Workspace: {ws.base}")
-    print(f"Agents:    Claude Opus 4.6, GPT-5.3-Codex, Gemini 3.1 Pro (all w/ thinking){palette['reset']}")
+    print(f"Agents:    Claude Opus 4.6, Gemini 3.1 Pro (both w/ thinking){palette['reset']}")
 
     ws.save("00-question.md", args.question)
     ws.log(f"Started: {args.question}")
@@ -1121,6 +1410,23 @@ def main():
         print(f"  {palette['dim']}Phase 3.5 error: {e} — continuing without audit{palette['reset']}\n")
         ws.log(f"Phase 3.5 FAILED: {e}")
 
+    # ── Phase 3.6: Repair Loop (if audit found issues) ──
+    if audit_text and audit_has_issues(audit_text):
+        try:
+            repair_research, repair_reviews, repair_audit = phase_repair(
+                args.question, audit_text, palette, ws, args.timeout,
+            )
+            # Merge repair findings into main results
+            all_research.update({f"{k} (repair)": v for k, v in repair_research.items()})
+            all_reviews.update({f"{k} (repair review)": v for k, v in repair_reviews.items()})
+            # Use the repair audit as the final audit (it reflects the updated evidence)
+            audit_text = audit_text + "\n\n---\n\n## Repair Audit\n" + repair_audit
+        except Exception as e:
+            print(f"  {palette['dim']}Phase 3.6 error: {e} — continuing without repair{palette['reset']}\n")
+            ws.log(f"Phase 3.6 FAILED: {e}")
+    elif audit_text:
+        print(f"{palette['dim']}No fabricated/unverifiable claims found — skipping repair.{palette['reset']}\n")
+
     # ── Phase 4: Reframe ──
     reframe_text = ""
     if not args.no_reframe:
@@ -1132,10 +1438,22 @@ def main():
             if status == "REVISE":
                 print(f"{palette['bold']}Framework revision triggered — running supplementary research...{palette['reset']}\n")
                 new_assignments = parse_sub_questions(reframe_text)
+                # Supplementary research
                 supplementary = phase_research(
                     args.question, new_assignments, palette, ws, args.timeout, tag="b",
                 )
+                # Challenge supplementary findings
+                supp_reviews = phase_challenge(
+                    args.question, supplementary, palette, ws, args.timeout, tag="b",
+                )
+                # Audit supplementary findings
+                supp_audit = phase_evidence_audit(
+                    args.question, supplementary, supp_reviews, palette, ws, args.timeout, tag="b",
+                )
+                # Merge into main results
                 all_research.update({f"{k} (supplementary)": v for k, v in supplementary.items()})
+                all_reviews.update({f"{k} (supp review)": v for k, v in supp_reviews.items()})
+                audit_text = audit_text + "\n\n---\n\n## Supplementary Research Audit\n" + supp_audit
         except Exception as e:
             print(f"  {palette['dim']}Phase 4 error: {e} — continuing without reframe{palette['reset']}\n")
             ws.log(f"Phase 4 FAILED: {e}")
@@ -1150,6 +1468,50 @@ def main():
     except Exception as e:
         print(f"\n{palette['bold']}Synthesis failed: {e}{palette['reset']}")
         print("All intermediate research is saved in the workspace.")
+
+    # ── Phase 5.5: Gap Analysis ──
+    if synthesis and not args.no_gap_research:
+        try:
+            gap_status, gap_response = phase_gap_analysis(
+                args.question, synthesis, palette, ws, args.timeout,
+            )
+            if gap_status == "RESEARCH_NEEDED":
+                print(f"{palette['bold']}Researchable gaps found — running gap research...{palette['reset']}\n")
+                gap_assignments = parse_sub_questions(gap_response)
+
+                # Phase 2c: Gap research (parallel)
+                gap_research = phase_research(
+                    args.question, gap_assignments, palette, ws, args.timeout, tag="c",
+                )
+
+                # Phase 3c: Cross-review gap findings (parallel)
+                gap_reviews = phase_challenge(
+                    args.question, gap_research, palette, ws, args.timeout, tag="c",
+                )
+
+                # Phase 3.5c: Audit gap findings
+                gap_audit = phase_evidence_audit(
+                    args.question, gap_research, gap_reviews, palette, ws, args.timeout, tag="c",
+                )
+
+                # Merge gap findings into main results
+                all_research.update({f"{k} (gap)": v for k, v in gap_research.items()})
+                all_reviews.update({f"{k} (gap review)": v for k, v in gap_reviews.items()})
+                audit_text = audit_text + "\n\n---\n\n## Gap Research Audit\n" + gap_audit
+
+                # Save original synthesis as v1
+                ws.save("phase5-synthesis-v1.md", synthesis)
+
+                # Re-synthesize with enriched evidence
+                synthesis = phase_synthesize(
+                    args.question, all_research, all_reviews, audit_text, reframe_text,
+                    palette, ws, args.timeout,
+                )
+            else:
+                print(f"{palette['dim']}No researchable gaps found — using original synthesis.{palette['reset']}\n")
+        except Exception as e:
+            print(f"  {palette['dim']}Phase 5.5 error: {e} — continuing with original synthesis{palette['reset']}\n")
+            ws.log(f"Phase 5.5 FAILED: {e}")
 
     elapsed = time.time() - start_time
     minutes = int(elapsed // 60)
